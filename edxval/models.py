@@ -674,6 +674,11 @@ class VideoAudioDescription(TimeStampedModel):
             if prop in ['file_name', 'file_format'] and value:
                 setattr(audio_desc, prop, value)
 
+        if not audio_desc.file_format or audio_desc.file_format not in dict(AudioDescriptionFormat.CHOICES):
+            raise ValueError(
+                f'file_format {audio_desc.file_format!r} is missing or not a supported audio description format'
+            )
+
         try:
             audio_desc.save_file(file_data, audio_desc.file_format, file_name=metadata.get('file_name'))
         except Exception:

@@ -459,10 +459,26 @@ def create_or_update_video_audio_description(video_id, metadata, file_data=None)
 
     Returns:
         unicode: URL of the saved audio description, or None if video not found.
+
+    Raises:
+        ValCannotCreateError: If required fields are missing or file_format is unsupported.
     """
+    metadata = {
+        prop: value
+        for prop, value in metadata.items()
+        if prop in ['file_name', 'file_format'] and value
+    }
+
     file_format = metadata.get('file_format')
-    if file_format and file_format not in dict(AudioDescriptionFormat.CHOICES):
+    file_name = metadata.get('file_name')
+
+    if not file_format:
+        raise ValCannotCreateError('file_format is required for audio description')
+    if file_format not in dict(AudioDescriptionFormat.CHOICES):
         raise ValCannotCreateError(f'{file_format} is not a supported audio description format')
+
+    if file_data is not None and not file_name:
+        raise ValCannotCreateError('file_name is required when uploading audio description file data')
 
     try:
         video = Video.objects.get(edx_video_id=video_id)
