@@ -175,6 +175,16 @@ VIDEO_TRANSCRIPTS_SETTINGS = dict(
     DIRECTORY_PREFIX='video-transcripts/',
 )
 
+VIDEO_AUDIO_DESCRIPTION_SETTINGS = dict(
+    # Backend storage
+    # STORAGE_CLASS='storages.backends.s3boto.S3BotoStorage',
+    # STORAGE_KWARGS=dict(bucket='audio-descriptions-bucket'),
+    # If you are changing prefix value then update the .gitignore accordingly
+    # so that audio-descriptions created during tests due to upload should be ignored
+    VIDEO_AUDIO_DESCRIPTION_MAX_BYTES=200 * 1024 * 1024,  # 200 MB
+    DIRECTORY_PREFIX='audio-descriptions/',
+)
+
 # Required by Django 2.2 to run management commands.
 TEMPLATES = [
     {
