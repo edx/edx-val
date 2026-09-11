@@ -1,6 +1,10 @@
 """
 Tests for the backfill_transcript_language_codes management command.
+
+The race tests reach into the command's internals on purpose: simulating a concurrent
+writer means interposing at a specific point inside the run.
 """
+# pylint: disable=protected-access
 from io import StringIO
 
 import ddt
@@ -8,6 +12,7 @@ from django.core.files.base import ContentFile
 from django.core.management import CommandError, call_command
 from django.test import TestCase
 
+from edxval.management.commands.backfill_transcript_language_codes import Command
 from edxval.models import CourseVideo, TranscriptProviderType, Video, VideoTranscript
 
 COURSE_ID = 'course-v1:edX+Val+2024'
@@ -23,7 +28,7 @@ def make_video(edx_video_id, course_id=COURSE_ID):
     return video
 
 
-def make_transcript(video, language_code, provider=TranscriptProviderType.CUSTOM, body=b'subtitle'):
+def make_transcript(video, language_code, provider=TranscriptProviderType.EDX_AI_TRANSLATIONS, body=b'subtitle'):
     """Create a VideoTranscript with a real stored file."""
     transcript = VideoTranscript.objects.create(
         video=video, language_code=language_code, provider=provider, file_format='srt',
@@ -101,7 +106,12 @@ class RenameTests(TestCase):
 
     def test_orphaned_transcript_is_renamed(self):
         """`video` is nullable, so a row with no video cannot collide with anything."""
-        transcript = VideoTranscript.objects.create(video=None, language_code='ko', file_format='srt')
+        transcript = VideoTranscript.objects.create(
+            video=None,
+            language_code='ko',
+            file_format='srt',
+            provider=TranscriptProviderType.EDX_AI_TRANSLATIONS,
+        )
 
         run(commit=True)
 
@@ -204,7 +214,8 @@ class DuplicateHandlingTests(TestCase):
         human_legacy = make_transcript(video, 'es', TranscriptProviderType.CUSTOM)
         ai_incumbent = make_transcript(video, 'es-419', TranscriptProviderType.EDX_AI_TRANSLATIONS)
 
-        run(commit=True, resolve_duplicates=True)
+        # Custom is out of scope by default, so widening is required to reach this row.
+        run(commit=True, resolve_duplicates=True, providers=[TranscriptProviderType.CUSTOM])
 
         self.assertFalse(VideoTranscript.objects.filter(id=ai_incumbent.id).exists())
         human_legacy.refresh_from_db()
@@ -266,6 +277,143 @@ class DuplicateHandlingTests(TestCase):
         self.assertTrue(loser.transcript.storage.exists(shared_name))
 
 
+class ProviderScopeTests(TestCase):
+    """
+    The legacy codes are not unique to this pipeline. 3PlayMedia's plan legitimately uses
+    'de', 'es', 'it', 'ko' and 'tr', so those rows are current vendor data rather than
+    pre-cutover artifacts and must not be rewritten or deleted.
+    """
+
+    def test_third_party_transcripts_are_not_renamed(self):
+        for provider in (TranscriptProviderType.THREE_PLAY_MEDIA, TranscriptProviderType.CIELO24):
+            transcript = make_transcript(make_video(f'tp-{provider}'), 'es', provider)
+
+            run(commit=True, resolve_duplicates=True)
+
+            transcript.refresh_from_db()
+            self.assertEqual(transcript.language_code, 'es', f'{provider} data must be untouched')
+
+    def test_custom_transcripts_are_not_renamed_by_default(self):
+        """'Custom' covers human uploads and pre-Nov-2024 pipeline output alike."""
+        transcript = make_transcript(make_video('custom'), 'ko', TranscriptProviderType.CUSTOM)
+
+        run(commit=True, resolve_duplicates=True)
+
+        transcript.refresh_from_db()
+        self.assertEqual(transcript.language_code, 'ko')
+
+    def test_out_of_scope_rows_are_reported(self):
+        make_transcript(make_video('tp2'), 'it', TranscriptProviderType.THREE_PLAY_MEDIA)
+
+        output = run()
+
+        self.assertIn('Out of scope', output)
+        self.assertIn(TranscriptProviderType.THREE_PLAY_MEDIA, output)
+
+    def test_include_provider_widens_scope(self):
+        transcript = make_transcript(make_video('widen'), 'it', TranscriptProviderType.CUSTOM)
+
+        run(commit=True, providers=[TranscriptProviderType.CUSTOM])
+
+        transcript.refresh_from_db()
+        self.assertEqual(transcript.language_code, 'it-it')
+
+    def test_unknown_provider_is_rejected(self):
+        with self.assertRaises(CommandError) as ctx:
+            run(providers=['NotAProvider'])
+        self.assertIn('NotAProvider', str(ctx.exception))
+
+    def test_newer_ai_row_never_displaces_an_older_vendor_row(self):
+        """Recency must not let a cheap machine translation beat a paid transcription."""
+        video = make_video('guard')
+        ours = make_transcript(video, 'es', TranscriptProviderType.EDX_AI_TRANSLATIONS)
+        theirs = make_transcript(video, 'es-419', TranscriptProviderType.THREE_PLAY_MEDIA)
+        VideoTranscript.objects.filter(id=theirs.id).update(modified='2020-01-01T00:00:00Z')
+
+        run(commit=True, resolve_duplicates=True)
+
+        # The vendor row is older but wins on provider tier, so ours is the one dropped.
+        theirs.refresh_from_db()
+        self.assertEqual(theirs.language_code, 'es-419')
+        self.assertEqual(theirs.provider, TranscriptProviderType.THREE_PLAY_MEDIA)
+        self.assertFalse(VideoTranscript.objects.filter(id=ours.id).exists())
+
+    def test_will_not_delete_another_providers_transcript_to_resolve(self):
+        """When the losing row belongs to a provider out of scope, nothing is deleted."""
+        video = make_video('guard2')
+        # Custom outranks 3PlayMedia, so the vendor row would be the loser -- but this run
+        # has no claim over it, so the pair is reported instead.
+        ours = make_transcript(video, 'es', TranscriptProviderType.CUSTOM)
+        theirs = make_transcript(video, 'es-419', TranscriptProviderType.THREE_PLAY_MEDIA)
+
+        output = run(commit=True, resolve_duplicates=True, providers=[TranscriptProviderType.CUSTOM])
+
+        self.assertTrue(VideoTranscript.objects.filter(id=theirs.id).exists())
+        ours.refresh_from_db()
+        self.assertEqual(ours.language_code, 'es')
+        self.assertIn('other provider owns the canonical code', output)
+
+    def test_our_row_may_still_lose_to_another_provider(self):
+        """The guard protects vendor rows from deletion, not ours from losing."""
+        video = make_video('lose')
+        ours = make_transcript(video, 'es', TranscriptProviderType.EDX_AI_TRANSLATIONS)
+        theirs = make_transcript(video, 'es-419', TranscriptProviderType.CUSTOM)
+
+        run(commit=True, resolve_duplicates=True)
+
+        self.assertFalse(VideoTranscript.objects.filter(id=ours.id).exists())
+        self.assertTrue(VideoTranscript.objects.filter(id=theirs.id).exists())
+
+
+class DryRunAccuracyTests(TestCase):
+    """A dry run has to predict what a committed run would actually do."""
+
+    def test_dry_run_reports_collisions(self):
+        video = make_video('dry1')
+        make_transcript(video, 'es', TranscriptProviderType.EDX_AI_TRANSLATIONS)
+        make_transcript(video, 'es-419', TranscriptProviderType.CUSTOM)
+
+        output = run()
+
+        self.assertIn('duplicate:', output)
+
+    def test_dry_run_totals_match_a_committed_run(self):
+        video = make_video('dry2')
+        make_transcript(video, 'es', TranscriptProviderType.EDX_AI_TRANSLATIONS)
+        make_transcript(video, 'es-419', TranscriptProviderType.CUSTOM)
+        make_transcript(make_video('dry3'), 'it')
+
+        predicted = run(resolve_duplicates=True)
+        with self.captureOnCommitCallbacks(execute=True):
+            actual = run(commit=True, resolve_duplicates=True)
+
+        # 'it' renames cleanly; the 'es' pair resolves by dropping our row.
+        self.assertIn('Would rename 1 transcript(s); would remove 1 duplicate(s); skipped 0.', predicted)
+        self.assertIn('Renamed 1 transcript(s); removed 1 duplicate(s); skipped 0.', actual)
+
+    def test_dry_run_writes_nothing_even_with_resolve_duplicates(self):
+        video = make_video('dry4')
+        legacy = make_transcript(video, 'es', TranscriptProviderType.EDX_AI_TRANSLATIONS)
+        incumbent = make_transcript(video, 'es-419', TranscriptProviderType.CUSTOM)
+        other = make_transcript(make_video('dry5'), 'it')
+
+        run(resolve_duplicates=True)
+
+        self.assertTrue(VideoTranscript.objects.filter(id=legacy.id).exists())
+        self.assertTrue(VideoTranscript.objects.filter(id=incumbent.id).exists())
+        other.refresh_from_db()
+        self.assertEqual(other.language_code, 'it')
+
+    def test_dry_run_counts_skips_when_not_resolving(self):
+        video = make_video('dry6')
+        make_transcript(video, 'es', TranscriptProviderType.EDX_AI_TRANSLATIONS)
+        make_transcript(video, 'es-419', TranscriptProviderType.CUSTOM)
+
+        output = run()
+
+        self.assertIn('Would rename 0 transcript(s); would remove 0 duplicate(s); skipped 1.', output)
+
+
 class CourseScopeTests(TestCase):
     """--course selection and validation."""
 
@@ -296,6 +444,84 @@ class CourseScopeTests(TestCase):
     def test_invalid_batch_size_is_rejected(self):
         with self.assertRaises(CommandError):
             run(batch_size=0)
+
+
+class StaleSnapshotTests(TestCase):
+    """
+    The id scan runs once per language, so a candidate can change before its turn.
+    `create_or_update` overwrites language_code and provider in place, and Studio exposes
+    that as a normal authoring action, so this is a supported operation racing the backfill
+    -- and it produces no unique-key conflict to catch.
+    """
+
+    @staticmethod
+    def _run_with_interference(transcript, **changes):
+        """
+        Apply `changes` to `transcript` in the window Copilot identified: after the id scan
+        that selects candidates, but before the row is processed. The row is still fetched
+        by id into the batch, so only the per-row recheck can catch it.
+        """
+        original = Command._exact_match_ids
+        seen = {}
+
+        def scan_then_interfere(command, course_ids, providers, code):
+            ids = original(command, course_ids, providers, code)
+            seen[code] = seen.get(code, 0) + 1
+            # Each code is scanned twice: once for handle()'s count, then again by
+            # _rewrite(). Interfering after the second scan leaves the id in the batch,
+            # so only the per-row recheck can stop it.
+            if seen[code] == 2 and transcript.id in ids:
+                VideoTranscript.objects.filter(id=transcript.id).update(**changes)
+            return ids
+
+        Command._exact_match_ids = scan_then_interfere
+        try:
+            return run(commit=True, resolve_duplicates=True)
+        finally:
+            Command._exact_match_ids = original
+
+    def test_language_changed_under_us_is_left_alone(self):
+        """An author's deliberate re-language must not be clobbered by the backfill."""
+        transcript = make_transcript(make_video('race-lang'), 'es')
+
+        output = self._run_with_interference(transcript, language_code='fr')
+
+        transcript.refresh_from_db()
+        self.assertEqual(transcript.language_code, 'fr', "author's change must survive")
+        self.assertIn('changed under us', output)
+
+    def test_provider_changed_under_us_is_left_alone(self):
+        transcript = make_transcript(make_video('race-provider'), 'es')
+
+        output = self._run_with_interference(transcript, provider=TranscriptProviderType.THREE_PLAY_MEDIA)
+
+        transcript.refresh_from_db()
+        self.assertEqual(transcript.language_code, 'es', 'row left scope; must not be renamed')
+        self.assertIn('changed under us', output)
+
+    def test_row_deleted_under_us_is_not_an_error(self):
+        transcript = make_transcript(make_video('race-delete'), 'es')
+        other = make_transcript(make_video('race-other'), 'es')
+
+        original = Command._exact_match_ids
+        seen = {}
+
+        def scan_then_delete(command, course_ids, providers, code):
+            ids = original(command, course_ids, providers, code)
+            seen[code] = seen.get(code, 0) + 1
+            if seen[code] == 2 and transcript.id in ids:
+                VideoTranscript.objects.filter(id=transcript.id).delete()
+            return ids
+
+        Command._exact_match_ids = scan_then_delete
+        try:
+            output = run(commit=True)
+        finally:
+            Command._exact_match_ids = original
+
+        self.assertIn('finished', output)
+        other.refresh_from_db()
+        self.assertEqual(other.language_code, 'es-419', 'the rest of the run must continue')
 
 
 class ConcurrencyTests(TestCase):
