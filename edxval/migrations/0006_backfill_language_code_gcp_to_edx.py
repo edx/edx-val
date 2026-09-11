@@ -20,13 +20,29 @@
 # from other providers (Custom, 3PlayMedia, Cielo24) were never subject to the GCP mapping and
 # must not be reinterpreted by this migration.
 #
-# Because ai-translations has already been sending edX codes since LP-1118 shipped, a video may
-# already have a row at the target edX code (e.g. a fresh "es-419" translation) by the time this
-# migration runs against its older "es" row. VideoTranscript enforces
-# unique_together = ("video", "language_code"), so in that case the stale GCP-coded row is dropped
-# in favor of the row that is already correct, rather than renamed into a collision.
+# VideoTranscript enforces unique_together = ("video", "language_code"), so a straight rename can
+# collide with a row that already exists at the target code for the same video:
+#
+# * If that existing row also came from ai-translations (e.g. a fresh "es-419" translation created
+#   after LP-1118 shipped, before this migration runs against the video's older "es" row), the
+#   stale GCP-coded duplicate is dropped in favor of the row that is already correct.
+# * If that existing row came from a *different* provider (Custom, 3PlayMedia, Cielo24), it is
+#   left entirely alone, and so is the stale ai-translations row -- automatically deleting either
+#   side would either destroy someone else's transcript or silently drop an AI translation with
+#   no replacement, and this migration does not have enough information to make that call. Any
+#   such case is logged so it can be resolved manually.
+#
+# Collisions are detected with a Python-level exact (case-sensitive) string comparison rather
+# than trusting the database comparison alone: several mappings below (e.g. "fr-CA" -> "fr-ca")
+# differ only in case, and MySQL's default case-insensitive collation would otherwise match the
+# very row being renamed against itself, misreporting it as an already-existing "new_code" row
+# and deleting it instead of renaming it.
+
+import logging
 
 from django.db import migrations
+
+logger = logging.getLogger(__name__)
 
 PROVIDER_EDX_AI_TRANSLATIONS = "edx_ai_translations"
 
@@ -51,41 +67,70 @@ GCP_TO_EDX = {**GCP_TO_EDX_UNAMBIGUOUS, **GCP_TO_EDX_AMBIGUOUS}
 EDX_TO_GCP = {edx_code: gcp_code for gcp_code, edx_code in GCP_TO_EDX.items()}
 
 
-def _rename_language_code(VideoTranscript, db_alias, old_code, new_code):
+def _backfill_language_code(VideoTranscript, db_alias, old_code, new_code):
     """
-    Renames all edx_ai_translations VideoTranscript rows from old_code to new_code, dropping
-    any old_code row that would otherwise collide with an existing new_code row for the same
-    video (unique_together = ("video", "language_code")).
+    Renames edx_ai_translations VideoTranscript rows from old_code to new_code, for one
+    (old_code, new_code) pair.
+
+    A video keeps its old_code row unrenamed, and this logs a warning, when a *different*
+    provider already occupies new_code for that video -- there's no safe automatic call to
+    make there. When the row occupying new_code is itself from ai-translations, the stale
+    old_code duplicate is dropped instead of renamed into a unique_together collision.
     """
-    old_rows = VideoTranscript.objects.using(db_alias).filter(
-        provider=PROVIDER_EDX_AI_TRANSLATIONS,
-        language_code=old_code,
+    old_video_ids = set(
+        VideoTranscript.objects.using(db_alias)
+        .filter(provider=PROVIDER_EDX_AI_TRANSLATIONS, language_code=old_code)
+        .values_list("video_id", flat=True)
     )
-    old_video_ids = set(old_rows.values_list("video_id", flat=True))
     if not old_video_ids:
         return
 
-    colliding_video_ids = set(
+    # Filtering on language_code=new_code at the DB level relies on whatever collation the
+    # column has -- under a case-insensitive collation this can also match the old_code row
+    # itself (e.g. a query for "fr-ca" matching a stored "fr-CA"), so every candidate is
+    # re-checked below with an exact, case-sensitive Python comparison before being trusted.
+    candidates = (
         VideoTranscript.objects.using(db_alias)
         .filter(language_code=new_code, video_id__in=old_video_ids)
-        .values_list("video_id", flat=True)
+        .values_list("video_id", "provider", "language_code")
     )
 
-    if colliding_video_ids:
-        # A row for the target code already exists (e.g. a fresh translation created after
-        # LP-1118 shipped) -- drop the stale GCP-coded duplicate rather than renaming into it.
+    ai_duplicate_video_ids = set()
+    other_provider_video_ids = set()
+    for video_id, provider, language_code in candidates:
+        if language_code != new_code:
+            # Case-insensitive collation matched the old_code row against itself -- not a real
+            # pre-existing new_code row.
+            continue
+        if provider == PROVIDER_EDX_AI_TRANSLATIONS:
+            ai_duplicate_video_ids.add(video_id)
+        else:
+            other_provider_video_ids.add(video_id)
+
+    if other_provider_video_ids:
+        logger.warning(
+            "0006_backfill_language_code_gcp_to_edx: leaving %r -> %r alone for %d video(s) "
+            "where a non-AI transcript already occupies %r; needs manual resolution: %s",
+            old_code, new_code, len(other_provider_video_ids), new_code,
+            sorted(other_provider_video_ids),
+        )
+
+    if ai_duplicate_video_ids:
+        # A row for the target code already exists from ai-translations itself (e.g. a fresh
+        # translation created after LP-1118 shipped) -- drop the stale GCP-coded duplicate
+        # rather than renaming into a collision.
         VideoTranscript.objects.using(db_alias).filter(
             provider=PROVIDER_EDX_AI_TRANSLATIONS,
             language_code=old_code,
-            video_id__in=colliding_video_ids,
+            video_id__in=ai_duplicate_video_ids,
         ).delete()
 
-    non_colliding_video_ids = old_video_ids - colliding_video_ids
-    if non_colliding_video_ids:
+    rename_video_ids = old_video_ids - ai_duplicate_video_ids - other_provider_video_ids
+    if rename_video_ids:
         VideoTranscript.objects.using(db_alias).filter(
             provider=PROVIDER_EDX_AI_TRANSLATIONS,
             language_code=old_code,
-            video_id__in=non_colliding_video_ids,
+            video_id__in=rename_video_ids,
         ).update(language_code=new_code)
 
 
@@ -94,22 +139,25 @@ def gcp_to_edx_language_codes(apps, schema_editor):
     db_alias = schema_editor.connection.alias
 
     for gcp_code, edx_code in GCP_TO_EDX.items():
-        _rename_language_code(VideoTranscript, db_alias, gcp_code, edx_code)
+        _backfill_language_code(VideoTranscript, db_alias, gcp_code, edx_code)
 
 
 def edx_to_gcp_language_codes(apps, schema_editor):
     """
-    Best-effort reverse. Note this is lossy for the ambiguous "es" case: any "es-es" rows
-    created by ai-translations after this migration ran (as opposed to "es-419") cannot be told
-    apart from "es-419" once both are collapsed back to "es", so on reverse they are merged under
-    "es" like the original ambiguous data was, per the same collision-drop rule as the forward
-    migration.
+    Best-effort reverse: renames each canonical edX code in EDX_TO_GCP back to its pre-LP-1118
+    GCP code, using the same collision rules as the forward migration.
+
+    This is necessarily lossy for the ambiguous "es" case in one specific way: "es-419" rows
+    are reversed back to "es", but "es-es" is not a key in EDX_TO_GCP (it was never a value
+    GCP_TO_EDX produces) and so is not touched here at all. Any "es-es" row ai-translations
+    wrote directly after this migration ran is left as "es-es" on reverse, not folded back into
+    "es" -- there's no record of it ever having been the ambiguous GCP form.
     """
     VideoTranscript = apps.get_model("edxval", "VideoTranscript")
     db_alias = schema_editor.connection.alias
 
     for edx_code, gcp_code in EDX_TO_GCP.items():
-        _rename_language_code(VideoTranscript, db_alias, edx_code, gcp_code)
+        _backfill_language_code(VideoTranscript, db_alias, edx_code, gcp_code)
 
 
 class Migration(migrations.Migration):
