@@ -169,7 +169,7 @@ class Command(BaseCommand):
             renamed, deleted, skipped = self._rewrite(
                 legacy_code,
                 canonical_code,
-                course_ids=course_ids,
+                candidate_ids=candidates,
                 providers=providers,
                 batch_size=batch_size,
                 resolve_duplicates=resolve_duplicates,
@@ -279,13 +279,29 @@ class Command(BaseCommand):
         wrote before then carry the 'Custom' default and are indistinguishable from a human
         upload. Deciding whether those should be rewritten needs a look at the real data,
         not a guess, so they are reported rather than silently included or ignored.
+
+        The legacy-code test is pushed into the database so this diagnostic does not drag the
+        whole transcript table into Python on every invocation, dry runs included. It only
+        narrows the rows: under MySQL's case-insensitive collation `language_code__in` also
+        matches rows already stored canonically ('pt-br' when asked for 'pt-BR'), so the exact
+        membership test below is what keeps the tally honest -- the same division of labour as
+        `_exact_match_ids`. Counting with a GROUP BY instead would not survive that collation,
+        which folds 'pt-BR' and 'pt-br' into one bucket under a single spelling.
         """
-        queryset = VideoTranscript.objects.exclude(provider__in=providers)
+        queryset = (
+            VideoTranscript.objects
+            .exclude(provider__in=providers)
+            .filter(language_code__in=list(LEGACY_TO_CANONICAL))
+        )
         if course_ids:
             queryset = queryset.filter(video__courses__course_id__in=course_ids).distinct()
 
         tally = {}
-        for provider, language_code in queryset.values_list('provider', 'language_code'):
+        # `id` is selected only to make DISTINCT apply per row. The course join above repeats
+        # a transcript once per matching course, so the `.distinct()` that removes those
+        # repeats would otherwise fold every row sharing a (provider, language_code) pair into
+        # a single one and report a count of 1 for any number of rows.
+        for _, provider, language_code in queryset.values_list('id', 'provider', 'language_code'):
             if language_code in LEGACY_TO_CANONICAL:
                 tally[provider] = tally.get(provider, 0) + 1
 
@@ -300,10 +316,16 @@ class Command(BaseCommand):
             )
         )
 
-    def _rewrite(self, legacy_code, canonical_code, *, course_ids, providers, batch_size,
+    def _rewrite(self, legacy_code, canonical_code, *, candidate_ids, providers, batch_size,
                  resolve_duplicates, commit):
         """
         Rename every legacy-coded transcript in scope, reporting or resolving duplicates.
+
+        `candidate_ids` is the id list `handle` has already scanned for this code, passed in
+        rather than rescanned here: the scan is the one unbounded query per code, and running
+        it twice could also let the count reported to the operator disagree with the rows
+        actually processed. Each id is re-read and re-checked in `_process_one` anyway, so a
+        single scan loses nothing.
 
         `VideoTranscript.video` is nullable and MySQL treats NULLs as distinct in a unique
         index, so orphaned rows cannot collide and are renamed unconditionally.
@@ -317,27 +339,34 @@ class Command(BaseCommand):
         deleted_total = 0
         skipped_total = 0
 
-        for chunk in _chunked(self._exact_match_ids(course_ids, providers, legacy_code), batch_size):
-            batch = list(VideoTranscript.objects.filter(id__in=chunk))
-            attached_video_ids = [t.video_id for t in batch if t.video_id is not None]
+        for chunk in _chunked(candidate_ids, batch_size):
+            # Only the id and the video are needed here -- every field is re-read under a lock
+            # in _process_one anyway -- so the batch is loaded as tuples rather than as model
+            # instances carrying each row's file field and text columns.
+            batch = list(VideoTranscript.objects.filter(id__in=chunk).values_list('id', 'video_id'))
+            attached_video_ids = [video_id for _, video_id in batch if video_id is not None]
             # Deliberately not provider-scoped: a transcript from any provider can occupy
             # the canonical code and block the rename, so all of them have to be seen.
             # Whether one may be *deleted* is decided per row in _process_one.
-            incumbents = {
-                transcript.video_id: transcript
-                for transcript in VideoTranscript.objects.filter(
+            #
+            # This set is only a hint; _process_one re-reads and re-validates the incumbent
+            # under a lock before acting on it. Excluding the chunk and re-checking the code
+            # exactly therefore buys no correctness -- they stop the case-insensitive
+            # collation from offering a case-only candidate as its own incumbent, which would
+            # cost a needless locking re-read for every row renamed.
+            occupied_video_ids = {
+                video_id
+                for video_id, language_code in VideoTranscript.objects.filter(
                     video_id__in=attached_video_ids,
                     language_code=canonical_code,
-                ).exclude(id__in=chunk)
-                if transcript.language_code == canonical_code
+                ).exclude(id__in=chunk).values_list('video_id', 'language_code')
+                if language_code == canonical_code
             }
 
-            for transcript in batch:
-                expect_incumbent = (
-                    transcript.video_id is not None and transcript.video_id in incumbents
-                )
+            for transcript_id, video_id in batch:
+                expect_incumbent = video_id is not None and video_id in occupied_video_ids
                 renamed, deleted, skipped = self._process_one(
-                    transcript.id,
+                    transcript_id,
                     canonical_code,
                     legacy_code=legacy_code,
                     expect_incumbent=expect_incumbent,
@@ -449,6 +478,10 @@ class Command(BaseCommand):
             .first()
         )
         # Guard the case-insensitive collation: only an exact match really occupies the code.
+        # Defensive rather than load-bearing: unique_together on (video, language_code) is
+        # itself case-insensitive under MySQL, so one video cannot hold two case variants for
+        # this query to choose the wrong one from. It costs nothing, and keeps the result
+        # correct if the table is ever loaded from a case-sensitive source.
         if incumbent is not None and incumbent.language_code != canonical_code:
             return None
         return incumbent

@@ -6,16 +6,63 @@ writer means interposing at a specific point inside the run.
 """
 # pylint: disable=protected-access
 from io import StringIO
+from unittest import mock
 
 import ddt
 from django.core.files.base import ContentFile
 from django.core.management import CommandError, call_command
+from django.db import models
+from django.db.models import Q
 from django.test import TestCase
 
 from edxval.management.commands.backfill_transcript_language_codes import Command
 from edxval.models import CourseVideo, TranscriptProviderType, Video, VideoTranscript
 
 COURSE_ID = 'course-v1:edX+Val+2024'
+OTHER_COURSE_ID = 'course-v1:edX+Val+2025'
+
+
+def _widen_language_lookups(args, kwargs):
+    """Rewrite `language_code` lookups into the wider set MySQL's collation would return."""
+    if 'language_code' in kwargs:
+        kwargs = dict(kwargs)
+        kwargs['language_code__iexact'] = kwargs.pop('language_code')
+    if 'language_code__in' in kwargs:
+        kwargs = dict(kwargs)
+        # No single ORM lookup spells "IN, case-insensitively"; OR the members together.
+        # Q(pk__in=[]) is the identity for OR here, and matches nothing on its own.
+        match_any = Q(pk__in=[])
+        for value in kwargs.pop('language_code__in'):
+            match_any |= Q(language_code__iexact=value)
+        args = args + (match_any,)
+    return args, kwargs
+
+
+class _CaseInsensitiveQuerySet(models.QuerySet):
+    """
+    A queryset that matches `language_code` the way MySQL does.
+
+    edx-platform runs this command on MySQL, whose default collation is case-insensitive:
+    `filter(language_code='pt-BR')` also returns rows stored as 'pt-br'. The test settings use
+    SQLite, which compares text case-sensitively, so there every such filter already returns
+    exactly the rows the command's own Python-side comparison would keep -- which makes those
+    comparisons no-ops and leaves the guards written for the collation untested.
+    """
+
+    def filter(self, *args, **kwargs):
+        args, kwargs = _widen_language_lookups(args, kwargs)
+        return super().filter(*args, **kwargs)
+
+    def exclude(self, *args, **kwargs):
+        args, kwargs = _widen_language_lookups(args, kwargs)
+        return super().exclude(*args, **kwargs)
+
+
+def mysql_collation_manager():
+    """A drop-in `VideoTranscript.objects` that matches language codes as MySQL would."""
+    manager = _CaseInsensitiveQuerySet.as_manager()
+    manager.model = VideoTranscript
+    return manager
 
 
 def make_video(edx_video_id, course_id=COURSE_ID):
@@ -139,43 +186,98 @@ class RenameTests(TestCase):
 
 class CaseSensitivityTests(TestCase):
     """
-    Four mappings differ only by case. Under MySQL's default case-insensitive collation the
-    database matches 'pt-BR' when asked for 'pt-br', so a row can look like its own
-    duplicate. These guard the case-sensitive comparison that prevents that.
+    Four of the nine mappings differ only by case, and edx-platform runs this command on
+    MySQL, whose default collation matches 'pt-BR' when asked for 'pt-br'. A row can therefore
+    look like its own duplicate, and a row already migrated can look like a fresh candidate.
+
+    These tests patch `VideoTranscript.objects` to match language codes the way MySQL does,
+    because the SQLite database the test settings use does not. Without that patch the
+    database-side filters return only exact matches by themselves, the command's Python-side
+    comparisons never change an outcome, and deleting them leaves the suite green.
+
+    The assertions here are deliberately about the run's reported totals as well as the final
+    rows: several ways of losing the guards leave the data correct but quietly reclassify rows
+    as candidates, collisions, or races.
+
+    Two nearby guards are knowingly left unpinned, because neither changes an outcome there is
+    anything to assert on: the chunk exclusion in `_rewrite` and the exact re-check in
+    `_locked_incumbent` only narrow a hint that `_process_one` re-validates under a lock. Their
+    comments say so.
     """
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(VideoTranscript, 'objects', mysql_collation_manager())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_collation_is_actually_simulated(self):
+        """
+        Guard the harness itself. If the patch stops widening lookups, every other test in
+        this class silently reverts to exercising SQLite's case-sensitive behaviour and goes
+        on passing for the wrong reason.
+        """
+        make_transcript(make_video('collation'), 'pt-BR')
+
+        self.assertEqual(VideoTranscript.objects.filter(language_code='pt-br').count(), 1)
+        self.assertEqual(VideoTranscript.objects.filter(language_code__in=['pt-br']).count(), 1)
 
     def test_case_only_rename_does_not_delete_the_row(self):
         transcript = make_transcript(make_video('v4'), 'pt-BR')
         file_name = transcript.transcript.name
 
-        run(commit=True, resolve_duplicates=True)
+        output = run(commit=True, resolve_duplicates=True)
 
         self.assertTrue(VideoTranscript.objects.filter(id=transcript.id).exists())
         transcript.refresh_from_db()
         self.assertEqual(transcript.language_code, 'pt-br')
         self.assertTrue(transcript.transcript.storage.exists(file_name))
+        # The collation offers this row to itself as the incumbent holding 'pt-br'. It must
+        # be renamed outright: not deleted as a duplicate, not skipped as a collision.
+        self.assertIn('Renamed 1 transcript(s); removed 0 duplicate(s); skipped 0.', output)
 
     def test_already_canonical_rows_are_untouched(self):
         transcript = make_transcript(make_video('v5'), 'pt-br')
         file_name = transcript.transcript.name
 
-        run(commit=True, resolve_duplicates=True)
+        output = run(commit=True, resolve_duplicates=True)
 
         transcript.refresh_from_db()
         self.assertEqual(transcript.language_code, 'pt-br')
         self.assertTrue(transcript.transcript.storage.exists(file_name))
+        # The scan for 'pt-BR' matches this row under the collation; only the exact
+        # comparison in _exact_match_ids keeps it off the candidate list entirely.
+        self.assertNotIn("'pt-BR' -> 'pt-br'", output)
+        self.assertIn('Renamed 0 transcript(s); removed 0 duplicate(s); skipped 0.', output)
 
     def test_mixed_case_population_survives(self):
         legacy = make_transcript(make_video('v6'), 'zh-CN')
         canonical = make_transcript(make_video('v7'), 'zh-cn')
 
-        run(commit=True, resolve_duplicates=True)
+        output = run(commit=True, resolve_duplicates=True)
 
         legacy.refresh_from_db()
         canonical.refresh_from_db()
         self.assertEqual(legacy.language_code, 'zh-cn')
         self.assertEqual(canonical.language_code, 'zh-cn')
         self.assertEqual(VideoTranscript.objects.count(), 2)
+        # The scan for 'zh-CN' also matches v7's already-canonical row. Counting it would
+        # report two candidates and then discard one as "changed under us".
+        self.assertIn("'zh-CN' -> 'zh-cn': 1 candidate(s)", output)
+        self.assertNotIn('changed under us', output)
+
+    def test_out_of_scope_tally_ignores_already_canonical_rows(self):
+        """
+        The out-of-scope diagnostic narrows with a database `IN` over the legacy codes, which
+        this collation widens to the canonical spellings too. Only rows genuinely still
+        holding a legacy code belong in the tally.
+        """
+        make_transcript(make_video('oos-legacy'), 'pt-BR', TranscriptProviderType.THREE_PLAY_MEDIA)
+        make_transcript(make_video('oos-done'), 'pt-br', TranscriptProviderType.THREE_PLAY_MEDIA)
+
+        output = run()
+
+        self.assertIn(f'{TranscriptProviderType.THREE_PLAY_MEDIA}: 1', output)
 
 
 class DuplicateHandlingTests(TestCase):
@@ -309,6 +411,29 @@ class ProviderScopeTests(TestCase):
 
         self.assertIn('Out of scope', output)
         self.assertIn(TranscriptProviderType.THREE_PLAY_MEDIA, output)
+
+    def test_out_of_scope_tally_counts_rows_not_distinct_pairs(self):
+        """
+        The --course filter joins through CourseVideo and needs .distinct() to drop the
+        repeats that join produces. Selecting only (provider, language_code) lets DISTINCT
+        fold every row sharing a pair into one, reporting 1 for any number of rows.
+        """
+        for index in range(3):
+            make_transcript(make_video(f'oos{index}'), 'it', TranscriptProviderType.THREE_PLAY_MEDIA)
+
+        output = run(courses=[COURSE_ID])
+
+        self.assertIn(f'{TranscriptProviderType.THREE_PLAY_MEDIA}: 3', output)
+
+    def test_out_of_scope_tally_counts_a_shared_video_once(self):
+        """The .distinct() still has to do its job: two matching courses, one row, one count."""
+        video = make_video('oos-multi')
+        CourseVideo.objects.create(video=video, course_id=OTHER_COURSE_ID)
+        make_transcript(video, 'it', TranscriptProviderType.THREE_PLAY_MEDIA)
+
+        output = run(courses=[COURSE_ID, OTHER_COURSE_ID])
+
+        self.assertIn(f'{TranscriptProviderType.THREE_PLAY_MEDIA}: 1', output)
 
     def test_include_provider_widens_scope(self):
         transcript = make_transcript(make_video('widen'), 'it', TranscriptProviderType.CUSTOM)
@@ -462,15 +587,13 @@ class StaleSnapshotTests(TestCase):
         by id into the batch, so only the per-row recheck can catch it.
         """
         original = Command._exact_match_ids
-        seen = {}
 
         def scan_then_interfere(command, course_ids, providers, code):
             ids = original(command, course_ids, providers, code)
-            seen[code] = seen.get(code, 0) + 1
-            # Each code is scanned twice: once for handle()'s count, then again by
-            # _rewrite(). Interfering after the second scan leaves the id in the batch,
-            # so only the per-row recheck can stop it.
-            if seen[code] == 2 and transcript.id in ids:
+            # The scan runs once per code and its result is handed straight to _rewrite, so
+            # interfering here leaves the id in the batch: the row is still fetched by id and
+            # only the per-row recheck can stop it.
+            if transcript.id in ids:
                 VideoTranscript.objects.filter(id=transcript.id).update(**changes)
             return ids
 
@@ -504,12 +627,10 @@ class StaleSnapshotTests(TestCase):
         other = make_transcript(make_video('race-other'), 'es')
 
         original = Command._exact_match_ids
-        seen = {}
 
         def scan_then_delete(command, course_ids, providers, code):
             ids = original(command, course_ids, providers, code)
-            seen[code] = seen.get(code, 0) + 1
-            if seen[code] == 2 and transcript.id in ids:
+            if transcript.id in ids:
                 VideoTranscript.objects.filter(id=transcript.id).delete()
             return ids
 
